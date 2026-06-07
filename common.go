@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"image"
@@ -70,11 +71,14 @@ func isImage(name string) bool {
 // outputPlan describes one output produced from a source image. JPEG sources
 // are transformed losslessly by jpegtran using jpegtranArgs (no re-encode);
 // PNG sources are transformed in-process with transform (also lossless). suffix
-// is inserted before the file extension.
+// is inserted before the file extension. resetOrientation rewrites the EXIF
+// Orientation tag of a JPEG output to Normal(1), for transforms (rotate) that
+// physically reorient the pixels so a copied-over tag would otherwise be stale.
 type outputPlan struct {
-	suffix       string
-	jpegtranArgs []string
-	transform    func(image.Image) image.Image
+	suffix           string
+	jpegtranArgs     []string
+	transform        func(image.Image) image.Image
+	resetOrientation bool
 }
 
 // process reads path, asks plan for the outputs to produce (given the source
@@ -107,17 +111,20 @@ func process(path, srcRoot, outDir string, plan func(image.Config) ([]outputPlan
 	}
 
 	// Only PNG needs its pixels in memory; JPEG is handed to jpegtran as-is.
+	// We also keep the raw PNG bytes so the source's EXIF (eXIf chunk) can be
+	// carried over — png.Encode does not preserve it.
 	var decoded image.Image
+	var srcEXIF []byte
 	if format == "png" {
-		df, err := os.Open(path)
+		raw, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		decoded, _, err = image.Decode(df)
-		df.Close()
+		decoded, _, err = image.Decode(bytes.NewReader(raw))
 		if err != nil {
 			return fmt.Errorf("decode: %w", err)
 		}
+		srcEXIF = pngChunk(raw, "eXIf")
 	}
 
 	ext := filepath.Ext(path)
@@ -130,14 +137,38 @@ func process(path, srcRoot, outDir string, plan func(image.Config) ([]outputPlan
 		}
 		switch format {
 		case "jpeg":
-			if err := commit(dst, func(w io.Writer) error {
-				return jpegtranTo(w, path, o.jpegtranArgs)
+			if err := commit(dst, func(tmp string) error {
+				if err := writeTo(tmp, func(w io.Writer) error {
+					return jpegtranTo(w, path, o.jpegtranArgs)
+				}); err != nil {
+					return err
+				}
+				if o.resetOrientation {
+					return setOrientationNormal(tmp)
+				}
+				return nil
 			}); err != nil {
 				return err
 			}
 		case "png":
-			if err := commit(dst, func(w io.Writer) error {
-				return png.Encode(w, o.transform(decoded))
+			if err := commit(dst, func(tmp string) error {
+				var buf bytes.Buffer
+				if err := png.Encode(&buf, o.transform(decoded)); err != nil {
+					return err
+				}
+				out := buf.Bytes()
+				if srcEXIF != nil {
+					out = insertAfterIHDR(out, srcEXIF)
+				}
+				if err := os.WriteFile(tmp, out, 0o644); err != nil {
+					return err
+				}
+				// A physical rotation makes a carried-over Orientation stale;
+				// reset it (also adds the tag when the source had no EXIF).
+				if o.resetOrientation {
+					return setOrientationNormal(tmp)
+				}
+				return nil
 			}); err != nil {
 				return err
 			}
@@ -151,11 +182,12 @@ func process(path, srcRoot, outDir string, plan func(image.Config) ([]outputPlan
 }
 
 // jpegtranTo runs a lossless jpegtran transform on src and writes the result to
-// w. Metadata is dropped (-copy none) to match the previous decode/encode
-// behavior and to avoid stale EXIF orientation after a rotate.
+// w. All metadata is copied (-copy all) so EXIF such as camera and date are
+// preserved; transforms that physically reorient pixels reset the now-stale
+// Orientation tag afterwards (see setOrientationNormal).
 func jpegtranTo(w io.Writer, src string, args []string) error {
 	full := make([]string, 0, len(args)+3)
-	full = append(full, "-copy", "none")
+	full = append(full, "-copy", "all")
 	full = append(full, args...)
 	full = append(full, src)
 
@@ -175,6 +207,60 @@ func jpegtranTo(w io.Writer, src string, args []string) error {
 	return nil
 }
 
+// setOrientationNormal sets the EXIF Orientation tag of the JPEG at path to
+// Normal(1), creating an EXIF block if the file has none. Used after a physical
+// rotation so the upright pixels aren't reoriented again by EXIF-aware viewers.
+func setOrientationNormal(path string) error {
+	cmd := exec.Command("exiv2", "-M", "set Exif.Image.Orientation 1", path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return errors.New("exiv2 not found in PATH (required to set EXIF orientation); install exiv2")
+		}
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return fmt.Errorf("exiv2: %s", msg)
+		}
+		return fmt.Errorf("exiv2: %w", err)
+	}
+	return nil
+}
+
+// pngChunk returns the verbatim bytes (length + type + data + CRC) of the first
+// chunk of the given type in a PNG file, or nil if absent or the data is
+// malformed. Returning the CRC unchanged keeps the chunk valid when re-spliced.
+func pngChunk(data []byte, typ string) []byte {
+	const sig = 8
+	if len(data) < sig {
+		return nil
+	}
+	for i := sig; i+12 <= len(data); {
+		ln := int(binary.BigEndian.Uint32(data[i:]))
+		end := i + 12 + ln
+		if ln < 0 || end > len(data) {
+			return nil
+		}
+		if string(data[i+4:i+8]) == typ {
+			return data[i:end]
+		}
+		i = end
+	}
+	return nil
+}
+
+// insertAfterIHDR returns png with chunk inserted immediately after the IHDR
+// chunk, a position valid for ancillary chunks such as eXIf.
+func insertAfterIHDR(png, chunk []byte) []byte {
+	const sig = 8
+	ihdrLen := int(binary.BigEndian.Uint32(png[sig:]))
+	pos := sig + 12 + ihdrLen
+	out := make([]byte, 0, len(png)+len(chunk))
+	out = append(out, png[:pos]...)
+	out = append(out, chunk...)
+	out = append(out, png[pos:]...)
+	return out
+}
+
 // sameFile reports whether a and b resolve to the same existing file,
 // accounting for symlinks and equivalent path spellings.
 func sameFile(a, b string) bool {
@@ -189,23 +275,24 @@ func sameFile(a, b string) bool {
 	return os.SameFile(ai, bi)
 }
 
-// commit writes to dst without ever overwriting an existing file. It writes via
-// a sibling temp file (so a failed write never leaves a truncated result) and
-// then hard-links it into place; the link fails atomically if dst already
-// exists, even under concurrent writers.
-func commit(dst string, write func(io.Writer) error) error {
+// commit produces dst without ever overwriting an existing file. It reserves a
+// sibling temp file, lets populate fill it in by path (so external tools like
+// jpegtran/exiv2 can operate on it), and then hard-links it into place; the
+// link fails atomically if dst already exists, even under concurrent writers.
+// A failed populate leaves dst untouched.
+func commit(dst string, populate func(tmpPath string) error) error {
 	tmp, err := os.CreateTemp(filepath.Dir(dst), ".hft-*.tmp")
 	if err != nil {
 		return err
 	}
 	tmpName := tmp.Name()
+	tmp.Close()              // populate owns the file from here, by path
 	defer os.Remove(tmpName) // no-op once the link below succeeds
-
-	if err := write(tmp); err != nil {
-		tmp.Close()
+	if err := os.Chmod(tmpName, 0o644); err != nil {
 		return err
 	}
-	if err := tmp.Close(); err != nil {
+
+	if err := populate(tmpName); err != nil {
 		return err
 	}
 	if err := os.Link(tmpName, dst); err != nil {
@@ -215,6 +302,19 @@ func commit(dst string, write func(io.Writer) error) error {
 		return err
 	}
 	return nil
+}
+
+// writeTo truncates the file at path and streams write's output into it.
+func writeTo(path string, write func(io.Writer) error) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if err := write(f); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 var logMu sync.Mutex

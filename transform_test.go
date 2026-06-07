@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
+	"image/png"
 	"testing"
 )
 
@@ -118,6 +122,39 @@ func TestCutPlanBarTooWide(t *testing.T) {
 	if _, err := cutPlan(image.Config{Width: 4, Height: 2}, 4); err == nil {
 		t.Error("expected error when bar >= width")
 	}
+}
+
+func TestPNGChunkRoundTrip(t *testing.T) {
+	// Encode a PNG, confirm it has no eXIf, splice one in, and read it back.
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, gradient(4, 3)); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	src := buf.Bytes()
+	if pngChunk(src, "eXIf") != nil {
+		t.Fatal("freshly encoded PNG unexpectedly has an eXIf chunk")
+	}
+
+	exif := makeChunk("eXIf", []byte("II*\x00\x08\x00\x00\x00"))
+	out := insertAfterIHDR(src, exif)
+
+	got := pngChunk(out, "eXIf")
+	if !bytes.Equal(got, exif) {
+		t.Fatalf("spliced chunk not recovered:\n got %x\nwant %x", got, exif)
+	}
+	// The spliced output must remain a decodable PNG.
+	if _, err := png.Decode(bytes.NewReader(out)); err != nil {
+		t.Fatalf("spliced PNG no longer decodes: %v", err)
+	}
+}
+
+// makeChunk builds a valid PNG chunk (length + type + data + CRC) for testing.
+func makeChunk(typ string, data []byte) []byte {
+	c := make([]byte, 0, 12+len(data))
+	c = binary.BigEndian.AppendUint32(c, uint32(len(data)))
+	c = append(c, typ...)
+	c = append(c, data...)
+	return binary.BigEndian.AppendUint32(c, crc32.ChecksumIEEE(c[4:]))
 }
 
 func equalArgs(a, b []string) bool {

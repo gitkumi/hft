@@ -59,9 +59,10 @@ func cmdRotate(args []string) {
 // by jpegtran in the DCT domain; PNG is rotated in-process.
 func rotatePlan(angle int) []outputPlan {
 	return []outputPlan{{
-		suffix:       fmt.Sprintf("_rotated_%d", angle),
-		jpegtranArgs: []string{"-rotate", strconv.Itoa(angle)},
-		transform:    func(img image.Image) image.Image { return rotateImage(img, angle) },
+		suffix:           fmt.Sprintf("_rotated_%d", angle),
+		jpegtranArgs:     []string{"-rotate", strconv.Itoa(angle)},
+		transform:        func(img image.Image) image.Image { return rotateImage(img, angle) },
+		resetOrientation: true,
 	}}
 }
 

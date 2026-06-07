@@ -5,35 +5,53 @@ Half frame tools — utilities for working with half-frame film scans.
 ## Commands
 
 - `hft cut [flags] <path>` — split scans laid out as `[photo][blackbar][photo]` into left/right halves.
+  Flags: `--bar` (middle bar width), `-o/--out`, `-j/--workers`.
 - `hft rotate [flags] <path>` — rotate images by 90, 180, or 270 degrees clockwise.
+  Flags: `-a/--angle`, `-o/--out`, `-j/--workers`.
+- `hft resize [flags] <path>` — resample images to a new size (lossy).
+  Flags: `-w/--width`, `-H/--height`, `--scale`, `--filter`, `-q/--quality`,
+  `-o/--out`, `-j/--workers`. Give `--width` or `--height` alone to preserve the
+  aspect ratio, both for an exact size, or `--scale 0.5` for a uniform factor.
 
-`<path>` may be a single image or a directory (walked recursively).
+`<path>` may be a single image or a directory (walked recursively). Supported
+formats are **JPEG** and **PNG**. Flags are POSIX-style (`--angle 90` or `-a 90`).
+Run `hft <command> --help` for full details.
 
 ## Lossless
 
-Both commands preserve image quality exactly:
+`cut` and `rotate` preserve image quality exactly:
 
 - **JPEG** is transformed in the DCT domain by [`jpegtran`](https://linux.die.net/man/1/jpegtran)
-  (from libjpeg-turbo) — no decode/re-encode, so pixels are bit-for-bit
-  preserved. `jpegtran` must be on your `PATH`. Because lossless JPEG transforms
-  work on 8/16px block boundaries, the `cut` split snaps to the nearest block.
-- **PNG** is decoded and re-encoded losslessly in-process (no external tools).
+  (libjpeg-turbo, must be on your `PATH`) — no decode/re-encode. Because lossless
+  transforms work on block boundaries, the `cut` split snaps to the nearest block.
+- **PNG** is decoded and re-encoded in-process, pixel-for-pixel lossless. Bit depth,
+  color type, and alpha are preserved exactly; only the byte-level filtering and
+  compression are recomputed, so output bytes may differ while every pixel matches.
 
-## EXIF metadata
+`resize` is **not** lossless: it resamples (high-quality Catmull-Rom by default;
+`--filter nearest|bilinear|catmullrom`) and re-encodes (at `--quality`, default 90,
+for JPEG). It keeps the source's bit-depth class and grayscale/color, but no metadata.
 
-EXIF (camera, date, GPS, etc.) is carried over to the output for both JPEG and
-PNG. For PNG it is preserved via the standard `eXIf` chunk — the source chunk is
-copied verbatim into the re-encoded file.
+## Metadata
 
-- `cut` copies metadata verbatim, including the `Orientation` tag.
-- `rotate` physically reorients the pixels, then resets `Orientation` to
-  Normal(1) so EXIF-aware viewers don't rotate the already-upright image again
-  (adding the tag if the source had none). This step uses
+For `cut` and `rotate`, metadata is carried over:
+
+- **JPEG** keeps everything (EXIF, ICC, etc.) via `jpegtran -copy all`.
+- **PNG** keeps color and metadata chunks (`iCCP`, `sRGB`, `gAMA`, `cHRM`, `pHYs`,
+  `tIME`, `eXIf`, text). Chunks tied to the source pixel format (`PLTE`, `tRNS`,
+  `bKGD`, `sBIT`, …) are dropped, since output is re-encoded as truecolor.
+
+For the `Orientation` tag:
+
+- `cut` copies it verbatim.
+- `rotate` physically reorients the pixels, then resets `Orientation` to Normal(1)
+  so EXIF-aware viewers don't re-rotate the upright image. This uses
   [`exiv2`](https://exiv2.org), which must be on your `PATH`.
+
+`resize` carries no metadata for either format.
 
 ## Notes
 
-- Output never overwrites an existing file. If a destination already exists,
-  that image is reported as an error and the original is left untouched.
-  `cut` names its outputs `<base>_L`/`<base>_R`, and `rotate` names its output
-  `<base>_rotated_<deg>`, so neither collides with the source.
+- Output never overwrites an existing file; an existing destination is reported as
+  an error and the original is left untouched. Outputs are named `<base>_L`/`<base>_R`
+  (`cut`), `<base>_rotated_<deg>` (`rotate`), and `<base>_<w>x<h>` (`resize`).

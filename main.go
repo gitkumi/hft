@@ -1,40 +1,37 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
+
+	"github.com/spf13/cobra"
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(2)
+	root := &cobra.Command{
+		Use:           "hft",
+		Short:         "Half-frame film scan tools",
+		Long:          "hft — utilities for working with half-frame film scans.\n\n<path> may be a single image or a directory (walked recursively).",
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
-	switch os.Args[1] {
-	case "cut":
-		cmdCut(os.Args[2:])
-	case "rotate":
-		cmdRotate(os.Args[2:])
-	case "-h", "--help", "help":
-		usage()
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
-		usage()
-		os.Exit(2)
+	root.AddCommand(cutCmd(), rotateCmd(), resizeCmd())
+
+	if err := root.Execute(); err != nil {
+		// Per-file failures are already reported by the workers; only surface
+		// other errors here.
+		if !errors.Is(err, errHadFailures) {
+			fmt.Fprintln(os.Stderr, "error:", err)
+		}
+		os.Exit(1)
 	}
 }
 
-func usage() {
-	prog := filepath.Base(os.Args[0])
-	fmt.Fprintf(os.Stderr, "usage: %s <command> [flags] <path>\n\n", prog)
-	fmt.Fprintln(os.Stderr, "commands:")
-	fmt.Fprintln(os.Stderr, "  cut     split half-frame scans into left/right halves")
-	fmt.Fprintln(os.Stderr, "  rotate  rotate images by 90, 180, or 270 degrees clockwise")
-	fmt.Fprintf(os.Stderr, "\nrun '%s <command> -h' for command-specific flags\n", prog)
-}
-
-func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "error:", err)
-	os.Exit(1)
+// addCommonFlags registers the --out and --workers flags shared by every
+// command; dirSuffix names the default output directory in the help text.
+func addCommonFlags(cmd *cobra.Command, out *string, workers *int, dirSuffix string) {
+	cmd.Flags().StringVarP(out, "out", "o", "",
+		fmt.Sprintf("output directory (default: <input>%s for dirs, alongside input for single files)", dirSuffix))
+	cmd.Flags().IntVarP(workers, "workers", "j", defaultWorkers, "number of parallel workers")
 }

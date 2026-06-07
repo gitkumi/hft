@@ -2,12 +2,9 @@ package main
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"image"
-	_ "image/jpeg" // register the JPEG decoder for image.DecodeConfig
-	"image/png"
 	"io"
 	"io/fs"
 	"os"
@@ -20,6 +17,34 @@ import (
 )
 
 var defaultWorkers = runtime.NumCPU()
+
+// errHadFailures signals that some files failed to process; their individual
+// errors have already been reported, so the top level just sets the exit code.
+var errHadFailures = errors.New("some files failed")
+
+// runCommand collects the images under path, processes each with plan across
+// the given number of workers, and writes results to outDir (defaulting to
+// <input><dirSuffix> for directories). It is the shared body of every command.
+func runCommand(path, out, dirSuffix string, workers int, plan func(image.Config) ([]outputPlan, error)) error {
+	if workers < 1 {
+		return errors.New("--workers must be >= 1")
+	}
+	files, srcRoot, outDir, err := collect(path, out, dirSuffix)
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return errors.New("no images found")
+	}
+	// The output directory is created lazily per file by process (which mirrors
+	// the source tree), so a run where every file fails leaves nothing behind.
+	if runJobs(files, workers, func(f string) error {
+		return process(f, srcRoot, outDir, plan)
+	}) > 0 {
+		return errHadFailures
+	}
+	return nil
+}
 
 func collect(path, out, dirSuffix string) (files []string, srcRoot, outDir string, err error) {
 	info, err := os.Stat(path)
@@ -68,23 +93,51 @@ func isImage(name string) bool {
 	return false
 }
 
+// outputExt chooses the output file extension for the detected format, keeping
+// the input's own extension (and its casing) when it already matches and only
+// substituting a canonical one when the input was misnamed.
+func outputExt(path, format string) string {
+	ext := filepath.Ext(path)
+	switch format {
+	case "jpeg":
+		if l := strings.ToLower(ext); l == ".jpg" || l == ".jpeg" {
+			return ext
+		}
+		return ".jpg"
+	case "png":
+		if strings.EqualFold(ext, ".png") {
+			return ext
+		}
+		return ".png"
+	}
+	return ext
+}
+
 // outputPlan describes one output produced from a source image. JPEG sources
 // are transformed losslessly by jpegtran using jpegtranArgs (no re-encode);
 // PNG sources are transformed in-process with transform (also lossless). suffix
 // is inserted before the file extension. resetOrientation rewrites the EXIF
-// Orientation tag of a JPEG output to Normal(1), for transforms (rotate) that
+// Orientation tag of the output to Normal(1), for transforms (rotate) that
 // physically reorient the pixels so a copied-over tag would otherwise be stale.
+//
+// resample marks an output whose transform resamples pixels (resize), so it is
+// produced by decoding and re-encoding every format — including JPEG, which
+// therefore bypasses the lossless jpegtran path. jpegQuality is the quality of
+// such a JPEG re-encode.
 type outputPlan struct {
 	suffix           string
 	jpegtranArgs     []string
 	transform        func(image.Image) image.Image
 	resetOrientation bool
+	resample         bool
+	jpegQuality      int
 }
 
 // process reads path, asks plan for the outputs to produce (given the source
 // dimensions), and writes each into outDir mirroring path's location under
-// srcRoot. Nothing is ever decoded for JPEG sources, so their quality is
-// preserved exactly; PNG sources are decoded once and re-encoded losslessly.
+// srcRoot. JPEG and PNG are dispatched to their own lossless writers
+// (resampling outputs are re-encoded instead); nothing ever overwrites an
+// existing file.
 func process(path, srcRoot, outDir string, plan func(image.Config) ([]outputPlan, error)) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -110,106 +163,105 @@ func process(path, srcRoot, outDir string, plan func(image.Config) ([]outputPlan
 		return err
 	}
 
-	// Only PNG needs its pixels in memory; JPEG is handed to jpegtran as-is.
-	// We also keep the raw PNG bytes so the source's EXIF (eXIf chunk) can be
-	// carried over — png.Encode does not preserve it.
+	// Decide whether we need the source pixels. Lossless geometric transforms
+	// only decode PNG (JPEG is handed to jpegtran by path); a resampling
+	// transform (resize) decodes every format, JPEG included.
+	resample := false
+	for _, o := range outs {
+		if o.resample {
+			resample = true
+		}
+	}
 	var decoded image.Image
-	var srcEXIF []byte
-	if format == "png" {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		decoded, _, err = image.Decode(bytes.NewReader(raw))
-		if err != nil {
-			return fmt.Errorf("decode: %w", err)
-		}
-		srcEXIF = pngChunk(raw, "eXIf")
+	var carry []byte
+	switch {
+	case resample:
+		decoded, err = loadDecoded(path)
+	case format == "png":
+		decoded, carry, err = loadPNG(path)
+	}
+	if err != nil {
+		return err
 	}
 
-	ext := filepath.Ext(path)
-	base := strings.TrimSuffix(filepath.Base(path), ext)
+	// Name outputs from the detected format, not the (possibly misleading)
+	// input extension, so a misnamed file still gets a correct one.
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	ext := outputExt(path, format)
 	names := make([]string, len(outs))
+	written := make([]string, 0, len(outs))
 	for i, o := range outs {
 		dst := filepath.Join(dstDir, base+o.suffix+ext)
 		if sameFile(dst, path) {
-			return fmt.Errorf("refusing to overwrite input %s; pass -out to choose a different directory", path)
-		}
-		switch format {
-		case "jpeg":
-			if err := commit(dst, func(tmp string) error {
-				if err := writeTo(tmp, func(w io.Writer) error {
-					return jpegtranTo(w, path, o.jpegtranArgs)
-				}); err != nil {
-					return err
-				}
-				if o.resetOrientation {
-					return setOrientationNormal(tmp)
-				}
-				return nil
-			}); err != nil {
-				return err
+			err = fmt.Errorf("refusing to overwrite input %s; pass --out to choose a different directory", path)
+		} else {
+			switch {
+			case o.resample:
+				err = writeResampled(dst, o.transform(decoded), format, o.jpegQuality)
+			case format == "jpeg":
+				err = writeJPEG(dst, path, o.jpegtranArgs, o.resetOrientation)
+			case format == "png":
+				err = writePNG(dst, o.transform(decoded), carry, o.resetOrientation)
+			default:
+				err = fmt.Errorf("unsupported format: %s", format)
 			}
-		case "png":
-			if err := commit(dst, func(tmp string) error {
-				var buf bytes.Buffer
-				if err := png.Encode(&buf, o.transform(decoded)); err != nil {
-					return err
-				}
-				out := buf.Bytes()
-				if srcEXIF != nil {
-					out = insertAfterIHDR(out, srcEXIF)
-				}
-				if err := os.WriteFile(tmp, out, 0o644); err != nil {
-					return err
-				}
-				// A physical rotation makes a carried-over Orientation stale;
-				// reset it (also adds the tag when the source had no EXIF).
-				if o.resetOrientation {
-					return setOrientationNormal(tmp)
-				}
-				return nil
-			}); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unsupported format: %s", format)
 		}
+		if err != nil {
+			// Roll back outputs already written for this source so a
+			// multi-output command (e.g. cut) is all-or-nothing. commit only
+			// ever creates new files, so these are ours to remove.
+			for _, w := range written {
+				os.Remove(w)
+			}
+			return err
+		}
+		written = append(written, dst)
 		names[i] = filepath.Base(dst)
 	}
 	logf("%s -> %s\n", path, strings.Join(names, ", "))
 	return nil
 }
 
-// jpegtranTo runs a lossless jpegtran transform on src and writes the result to
-// w. All metadata is copied (-copy all) so EXIF such as camera and date are
-// preserved; transforms that physically reorient pixels reset the now-stale
-// Orientation tag afterwards (see setOrientationNormal).
-func jpegtranTo(w io.Writer, src string, args []string) error {
-	full := make([]string, 0, len(args)+3)
-	full = append(full, "-copy", "all")
-	full = append(full, args...)
-	full = append(full, src)
-
-	cmd := exec.Command("jpegtran", full...)
-	cmd.Stdout = w
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			return errors.New("jpegtran not found in PATH (required for lossless JPEG transforms); install libjpeg-turbo")
-		}
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return fmt.Errorf("jpegtran: %s", msg)
-		}
-		return fmt.Errorf("jpegtran: %w", err)
+// loadDecoded fully decodes the image at path using whichever registered format
+// matches. Used by the resampling path, which re-encodes every format and so
+// needs the pixels regardless of source type (including JPEG).
+func loadDecoded(path string) (image.Image, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	defer f.Close()
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return img, nil
 }
 
-// setOrientationNormal sets the EXIF Orientation tag of the JPEG at path to
+// writeResampled re-encodes an already-resampled image into dst in the source's
+// format, never overwriting an existing file. Unlike the geometric writers this
+// is not lossless: JPEG is re-encoded at jpegQuality, and metadata is not
+// carried (the pixels have changed, so a copied-over EXIF thumbnail or
+// dimensions would be stale).
+func writeResampled(dst string, img image.Image, format string, jpegQuality int) error {
+	return commit(dst, func(tmp string) error {
+		return writeTo(tmp, func(w io.Writer) error {
+			switch format {
+			case "jpeg":
+				return encodeJPEG(w, img, jpegQuality)
+			case "png":
+				return pngEncoder.Encode(w, img)
+			default:
+				return fmt.Errorf("unsupported format: %s", format)
+			}
+		})
+	})
+}
+
+// setOrientationNormal sets the EXIF Orientation tag of the image at path to
 // Normal(1), creating an EXIF block if the file has none. Used after a physical
 // rotation so the upright pixels aren't reoriented again by EXIF-aware viewers.
+// Works for both JPEG and PNG (exiv2 edits the eXIf chunk for the latter).
 func setOrientationNormal(path string) error {
 	cmd := exec.Command("exiv2", "-M", "set Exif.Image.Orientation 1", path)
 	var stderr bytes.Buffer
@@ -224,41 +276,6 @@ func setOrientationNormal(path string) error {
 		return fmt.Errorf("exiv2: %w", err)
 	}
 	return nil
-}
-
-// pngChunk returns the verbatim bytes (length + type + data + CRC) of the first
-// chunk of the given type in a PNG file, or nil if absent or the data is
-// malformed. Returning the CRC unchanged keeps the chunk valid when re-spliced.
-func pngChunk(data []byte, typ string) []byte {
-	const sig = 8
-	if len(data) < sig {
-		return nil
-	}
-	for i := sig; i+12 <= len(data); {
-		ln := int(binary.BigEndian.Uint32(data[i:]))
-		end := i + 12 + ln
-		if ln < 0 || end > len(data) {
-			return nil
-		}
-		if string(data[i+4:i+8]) == typ {
-			return data[i:end]
-		}
-		i = end
-	}
-	return nil
-}
-
-// insertAfterIHDR returns png with chunk inserted immediately after the IHDR
-// chunk, a position valid for ancillary chunks such as eXIf.
-func insertAfterIHDR(png, chunk []byte) []byte {
-	const sig = 8
-	ihdrLen := int(binary.BigEndian.Uint32(png[sig:]))
-	pos := sig + 12 + ihdrLen
-	out := make([]byte, 0, len(png)+len(chunk))
-	out = append(out, png[:pos]...)
-	out = append(out, chunk...)
-	out = append(out, png[pos:]...)
-	return out
 }
 
 // sameFile reports whether a and b resolve to the same existing file,
@@ -288,17 +305,50 @@ func commit(dst string, populate func(tmpPath string) error) error {
 	tmpName := tmp.Name()
 	tmp.Close()              // populate owns the file from here, by path
 	defer os.Remove(tmpName) // no-op once the link below succeeds
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return err
-	}
 
 	if err := populate(tmpName); err != nil {
+		return err
+	}
+	// Set permissions after populate: tools like exiv2 rewrite the file
+	// in place (new inode), which would otherwise discard an earlier chmod.
+	if err := os.Chmod(tmpName, 0o644); err != nil {
 		return err
 	}
 	if err := os.Link(tmpName, dst); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return fmt.Errorf("destination already exists: %s", dst)
 		}
+		// Hard links may be unsupported by the destination filesystem (some
+		// FUSE, FAT/exFAT, or network mounts). Fall back to an exclusive
+		// create + copy, which still refuses to overwrite an existing file.
+		return copyExclusive(tmpName, dst)
+	}
+	return nil
+}
+
+// copyExclusive copies srcPath to dst, failing if dst already exists. The
+// O_EXCL create is atomic, so the no-overwrite guarantee holds even under
+// concurrent writers; a partial copy is removed so a failure leaves no output.
+func copyExclusive(srcPath, dst string) error {
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("destination already exists: %s", dst)
+		}
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(dst)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(dst)
 		return err
 	}
 	return nil

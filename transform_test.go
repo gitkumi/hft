@@ -124,27 +124,44 @@ func TestCutPlanBarTooWide(t *testing.T) {
 	}
 }
 
-func TestPNGChunkRoundTrip(t *testing.T) {
-	// Encode a PNG, confirm it has no eXIf, splice one in, and read it back.
+func TestPNGCarryChunks(t *testing.T) {
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, gradient(4, 3)); err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	src := buf.Bytes()
-	if pngChunk(src, "eXIf") != nil {
-		t.Fatal("freshly encoded PNG unexpectedly has an eXIf chunk")
+	base := buf.Bytes()
+	if pngCarryChunks(base) != nil {
+		t.Fatal("freshly encoded PNG unexpectedly has metadata chunks")
 	}
 
-	exif := makeChunk("eXIf", []byte("II*\x00\x08\x00\x00\x00"))
-	out := insertAfterIHDR(src, exif)
+	// iCCP (a color profile) must be preserved; bKGD (pixel-encoding) dropped.
+	icc := makeChunk("iCCP", []byte("p\x00\x00deflated"))
+	bkgd := makeChunk("bKGD", []byte{0, 0, 0, 0, 0, 0})
+	withMeta := insertAfterIHDR(base, append(append([]byte{}, icc...), bkgd...))
 
-	got := pngChunk(out, "eXIf")
-	if !bytes.Equal(got, exif) {
-		t.Fatalf("spliced chunk not recovered:\n got %x\nwant %x", got, exif)
+	carry := pngCarryChunks(withMeta)
+	if !bytes.Contains(carry, icc) {
+		t.Error("iCCP color profile should be preserved")
 	}
-	// The spliced output must remain a decodable PNG.
-	if _, err := png.Decode(bytes.NewReader(out)); err != nil {
-		t.Fatalf("spliced PNG no longer decodes: %v", err)
+	if bytes.Contains(carry, bkgd) {
+		t.Error("bKGD should be dropped (invalid after RGBA re-encode)")
+	}
+
+	// Re-splicing only the carried chunks must yield a decodable PNG.
+	if _, err := png.Decode(bytes.NewReader(insertAfterIHDR(base, carry))); err != nil {
+		t.Fatalf("re-spliced PNG no longer decodes: %v", err)
+	}
+}
+
+func TestPNGCarryChunksMalformed(t *testing.T) {
+	// Too short to hold the signature: must not panic, returns nil.
+	if got := pngCarryChunks([]byte("short")); got != nil {
+		t.Errorf("short input: got %d bytes, want nil", len(got))
+	}
+	// A declared chunk length that overruns the buffer must be rejected.
+	bad := append([]byte("\x89PNG\r\n\x1a\n"), 0xff, 0xff, 0xff, 0xff, 'i', 'C', 'C', 'P')
+	if got := pngCarryChunks(bad); got != nil {
+		t.Errorf("overrunning chunk: got %d bytes, want nil", len(got))
 	}
 }
 

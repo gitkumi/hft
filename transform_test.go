@@ -79,7 +79,7 @@ func sameColor(a, b color.Color) bool {
 
 func TestCutPlan(t *testing.T) {
 	// width 7, bar 1 -> half = 3; left = [0,3), right = [4,7).
-	outs, err := cutPlan(image.Config{Width: 7, Height: 2}, 1)
+	outs, err := cutPlan(srcInfo{cfg: image.Config{Width: 7, Height: 2}}, 1)
 	if err != nil {
 		t.Fatalf("cutPlan: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestCutPlan(t *testing.T) {
 }
 
 func TestCutPlanBarTooWide(t *testing.T) {
-	if _, err := cutPlan(image.Config{Width: 4, Height: 2}, 4); err == nil {
+	if _, err := cutPlan(srcInfo{cfg: image.Config{Width: 4, Height: 2}}, 4); err == nil {
 		t.Error("expected error when bar >= width")
 	}
 }

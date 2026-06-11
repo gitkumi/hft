@@ -18,14 +18,18 @@ import (
 
 var defaultWorkers = runtime.NumCPU()
 
-// errHadFailures signals that some files failed to process; their individual
-// errors have already been reported, so the top level just sets the exit code.
-var errHadFailures = errors.New("some files failed")
+// srcInfo describes a source image for planning: its path (for messages), its
+// dimensions, and its EXIF Orientation tag (0 when absent).
+type srcInfo struct {
+	path        string
+	cfg         image.Config
+	orientation int
+}
 
 // runCommand collects the images under path, processes each with plan across
 // the given number of workers, and writes results to outDir (defaulting to
 // <input><dirSuffix> for directories). It is the shared body of every command.
-func runCommand(path, out, dirSuffix string, workers int, plan func(image.Config) ([]outputPlan, error)) error {
+func runCommand(path, out, dirSuffix string, workers int, plan func(srcInfo) ([]outputPlan, error)) error {
 	if workers < 1 {
 		return errors.New("--workers must be >= 1")
 	}
@@ -38,10 +42,12 @@ func runCommand(path, out, dirSuffix string, workers int, plan func(image.Config
 	}
 	// The output directory is created lazily per file by process (which mirrors
 	// the source tree), so a run where every file fails leaves nothing behind.
-	if runJobs(files, workers, func(f string) error {
+	if failed := runJobs(files, workers, func(f string) error {
 		return process(f, srcRoot, outDir, plan)
-	}) > 0 {
-		return errHadFailures
+	}); failed > 0 {
+		// Individual errors were already reported by the workers as they
+		// happened; this summary sets the exit code and the final line.
+		return fmt.Errorf("%d of %d files failed", failed, len(files))
 	}
 	return nil
 }
@@ -117,8 +123,10 @@ func outputExt(path, format string) string {
 // are transformed losslessly by jpegtran using jpegtranArgs (no re-encode);
 // PNG sources are transformed in-process with transform (also lossless). suffix
 // is inserted before the file extension. resetOrientation rewrites the EXIF
-// Orientation tag of the output to Normal(1), for transforms (rotate) that
-// physically reorient the pixels so a copied-over tag would otherwise be stale.
+// Orientation tag of the output to Normal(1); it is set by transforms (rotate)
+// when the source carried a non-Normal tag that the physical reorientation has
+// made stale. Sources without such a tag skip the rewrite, so they don't need
+// exiv2 at all.
 //
 // resample marks an output whose transform resamples pixels (resize), so it is
 // produced by decoding and re-encoding every format — including JPEG, which
@@ -134,11 +142,11 @@ type outputPlan struct {
 }
 
 // process reads path, asks plan for the outputs to produce (given the source
-// dimensions), and writes each into outDir mirroring path's location under
-// srcRoot. JPEG and PNG are dispatched to their own lossless writers
-// (resampling outputs are re-encoded instead); nothing ever overwrites an
-// existing file.
-func process(path, srcRoot, outDir string, plan func(image.Config) ([]outputPlan, error)) error {
+// dimensions and EXIF orientation), and writes each into outDir mirroring
+// path's location under srcRoot. JPEG and PNG are dispatched to their own
+// lossless writers (resampling outputs are re-encoded instead); nothing ever
+// overwrites an existing file.
+func process(path, srcRoot, outDir string, plan func(srcInfo) ([]outputPlan, error)) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -148,8 +156,12 @@ func process(path, srcRoot, outDir string, plan func(image.Config) ([]outputPlan
 	if err != nil {
 		return fmt.Errorf("decode: %w", err)
 	}
+	orientation, err := readOrientation(path, format)
+	if err != nil {
+		return err
+	}
 
-	outs, err := plan(cfg)
+	outs, err := plan(srcInfo{path: path, cfg: cfg, orientation: orientation})
 	if err != nil {
 		return err
 	}
@@ -321,7 +333,9 @@ func commit(dst string, populate func(tmpPath string) error) error {
 		// Hard links may be unsupported by the destination filesystem (some
 		// FUSE, FAT/exFAT, or network mounts). Fall back to an exclusive
 		// create + copy, which still refuses to overwrite an existing file.
-		return copyExclusive(tmpName, dst)
+		if cErr := copyExclusive(tmpName, dst); cErr != nil {
+			return fmt.Errorf("hard link failed (%v); copy fallback: %w", err, cErr)
+		}
 	}
 	return nil
 }
@@ -348,6 +362,12 @@ func copyExclusive(srcPath, dst string) error {
 		return err
 	}
 	if err := out.Close(); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	// Match the hard-link path, which fixes the output at 0644 regardless of
+	// umask; the O_EXCL create above is umask-masked.
+	if err := os.Chmod(dst, 0o644); err != nil {
 		os.Remove(dst)
 		return err
 	}

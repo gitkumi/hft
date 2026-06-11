@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"os"
 
@@ -19,11 +18,7 @@ func main() {
 	root.AddCommand(cutCmd(), rotateCmd(), resizeCmd())
 
 	if err := root.Execute(); err != nil {
-		// Per-file failures are already reported by the workers; only surface
-		// other errors here.
-		if !errors.Is(err, errHadFailures) {
-			fmt.Fprintln(os.Stderr, "error:", err)
-		}
+		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }

@@ -10,9 +10,11 @@ import (
 )
 
 // pngMetaChunks lists ancillary PNG chunk types that carry color or metadata
-// information and remain valid after re-encoding the pixels to truecolor RGBA.
-// Pixel-encoding chunks (PLTE, tRNS, bKGD, sBIT, hIST, sPLT) are intentionally
-// excluded: the re-encode changes the pixel format, which would invalidate them.
+// information independent of how the pixels are encoded, so they stay valid
+// across a re-encode. Chunks tied to the source's exact pixel encoding (PLTE,
+// tRNS, bKGD, sBIT, hIST, sPLT) are intentionally excluded: the encoder
+// regenerates the palette and transparency as needed for the output's own
+// pixel format, and the rest could misdescribe it.
 // pHYs (physical resolution) is kept verbatim; for the near-universal case of a
 // square DPI this is exact, and only anisotropic DPI under a 90°/270° rotate
 // would be slightly off.

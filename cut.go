@@ -23,8 +23,8 @@ func cutCmd() *cobra.Command {
 			if bar < 0 {
 				return errors.New("--bar must be >= 0")
 			}
-			return runCommand(args[0], out, "_cut", workers, func(cfg image.Config) ([]outputPlan, error) {
-				return cutPlan(cfg, bar)
+			return runCommand(args[0], out, "_cut", workers, func(src srcInfo) ([]outputPlan, error) {
+				return cutPlan(src, bar)
 			})
 		},
 	}
@@ -33,14 +33,23 @@ func cutCmd() *cobra.Command {
 	return cmd
 }
 
-// cutPlan splits a cfg-sized image into its left and right halves, dropping a
+// cutPlan splits the source image into its left and right halves, dropping a
 // center band of width bar. When (width-bar) is odd the leftover center column
-// is dropped. For JPEG the split snaps to the nearest MCU boundary so the crop
-// stays lossless.
-func cutPlan(cfg image.Config, bar int) ([]outputPlan, error) {
-	w, h := cfg.Width, cfg.Height
+// is dropped. For JPEG, jpegtran keeps the crop lossless by snapping each
+// crop's left edge down to the previous MCU boundary and widening the region
+// accordingly, so the right half can come out up to one MCU wider than the
+// left and include part of the bar.
+func cutPlan(src srcInfo, bar int) ([]outputPlan, error) {
+	w, h := src.cfg.Width, src.cfg.Height
 	if bar >= w {
 		return nil, fmt.Errorf("bar (%d) >= image width (%d)", bar, w)
+	}
+	// The split runs down the stored pixels; a non-Normal Orientation means
+	// viewers show the image reoriented, so _L/_R may not be what's displayed
+	// as left/right (for orientations 5-8 they are actually top/bottom).
+	if src.orientation > 1 {
+		logErrf("%s: warning: EXIF orientation %d is copied verbatim; the split follows the stored pixels, so _L/_R may not match the displayed left/right\n",
+			src.path, src.orientation)
 	}
 	half := (w - bar) / 2
 	if half <= 0 {

@@ -57,8 +57,8 @@ func resizeCmd() *cobra.Command {
 			if scale != 0 && (width != 0 || height != 0) {
 				return errors.New("--scale cannot be combined with --width/--height")
 			}
-			return runCommand(args[0], out, "_resized", workers, func(cfg image.Config) ([]outputPlan, error) {
-				return resizePlan(cfg, width, height, scale, sc, quality)
+			return runCommand(args[0], out, "_resized", workers, func(src srcInfo) ([]outputPlan, error) {
+				return resizePlan(src.cfg, width, height, scale, sc, quality)
 			})
 		},
 	}
@@ -71,12 +71,19 @@ func resizeCmd() *cobra.Command {
 	return cmd
 }
 
+// maxTargetPixels caps resize targets so a typo'd --scale or --width fails
+// with a clear error instead of attempting a multi-gigabyte allocation.
+const maxTargetPixels = 1 << 30
+
 // resizePlan computes the target size for a cfg-sized image and returns a single
 // resampling output named "_<w>x<h>".
 func resizePlan(cfg image.Config, width, height int, scale float64, sc xdraw.Interpolator, quality int) ([]outputPlan, error) {
 	tw, th := targetSize(cfg.Width, cfg.Height, width, height, scale)
 	if tw < 1 || th < 1 {
 		return nil, fmt.Errorf("invalid target size %dx%d", tw, th)
+	}
+	if int64(tw)*int64(th) > maxTargetPixels {
+		return nil, fmt.Errorf("target size %dx%d exceeds the %d-pixel limit", tw, th, maxTargetPixels)
 	}
 	return []outputPlan{{
 		suffix:      fmt.Sprintf("_%dx%d", tw, th),
@@ -131,6 +138,14 @@ func resampleDst(src image.Image, w, h int) draw.Image {
 	}
 }
 
-func round(f float64) int { return int(math.Round(f)) }
+// round converts to int, saturating at MaxInt32: a float-to-int conversion
+// that overflows is implementation-defined in Go, and resizePlan's pixel cap
+// then rejects the saturated size with a clear error.
+func round(f float64) int {
+	if r := math.Round(f); r < math.MaxInt32 {
+		return int(r)
+	}
+	return math.MaxInt32
+}
 
 func clamp1(n int) int { return max(n, 1) }

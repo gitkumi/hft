@@ -34,6 +34,15 @@ func TestTargetSize(t *testing.T) {
 	}
 }
 
+// TestResizePlanRejectsHugeTarget guards against a typo'd --scale attempting a
+// multi-gigabyte allocation.
+func TestResizePlanRejectsHugeTarget(t *testing.T) {
+	_, err := resizePlan(image.Config{Width: 100000, Height: 100000}, 0, 0, 1000, xdraw.NearestNeighbor, 90)
+	if err == nil {
+		t.Error("expected an error for a target far beyond the pixel limit")
+	}
+}
+
 // TestResampleDepthPreserved checks that resizing keeps a 16-bit source 16-bit
 // and grayscale grayscale, and promotes paletted to truecolor (so resampling
 // isn't pinned to a fixed palette).
